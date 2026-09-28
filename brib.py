@@ -1,254 +1,166 @@
-#!/usr/bin/env python
+# ============================================================
+# Tookie-OSINT API Wrapper (v2)
+# Chama o brib.py corretamente e retorna JSON
+# ============================================================
 
-import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
+import sys
+import json
+import glob
+import time
+import subprocess
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-from modules.fancy import logo
-from modules.modules import (
-    check_update,
-    get_header_file,
-    get_system_data,
-    load_fields,
-    load_sites,
-    load_user_agents,
-    load_user_file,
-    scan_site,
-    scan_webscraper,
-    write_to_file,
-    motd,
-)
-from modules.webscraper import close_driver
-from modules.files import (
-    make_restore,
-    load_restore,
-    send_webhook
-)
-from modules.webui import (
-    run_webui
-)
+app = Flask(__name__)
+CORS(app)
 
-# initializes the arg parser
-parser = argparse.ArgumentParser(
-    description="Username OSINT scanner",
-    prog="tookie-osint",
-    formatter_class=argparse.RawTextHelpFormatter,
-    epilog="""
-Examples:
-  Basic scan (default txt output):
-    tookie-osint -u alfred
+API_VERSION = "2.0.0"
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-  JSON output with 10 threads:
-    tookie-osint -u alfred -o json -t 10
 
-  Scan usernames from a file:
-    tookie-osint -U users.txt -o csv
+# ============================================================
+# ROTA RAIZ - Health check
+# ============================================================
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "service": "Tookie-OSINT API",
+        "version": API_VERSION,
+        "status": "online",
+        "endpoints": {
+            "POST /search": "Busca por username",
+            "GET /health": "Status"
+        }
+    })
 
-  Use proxy and show all results:
-    tookie-osint -u alfred -p http://127.0.0.1:8080 -a
 
-  Skip random headers:
-    tookie-osint -u alfred --skipheaders
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "version": API_VERSION})
 
-  Use webscraper:
-    tookie-osint -u alfred -W -H
 
-  Use a user file list
-    tookie-osint -U users.txt -t 20
-""",
-)
-# arguments
-# parser.add_argument("-h", "--help",)
-group = parser.add_mutually_exclusive_group(required=True)
-group.add_argument("-u", "--user", help="Username to scan")
-group.add_argument("-U", "--userfile", help="File path to username file")
-parser.add_argument(
-    "-t", "--threads", type=int, default=2, help="Threads. Defualt is 2"
-)
-parser.add_argument(
-    "-d", "--debug", action="store_true", help="Allows debugging options"
-)
-parser.add_argument(
-    "-sk", "--skipheaders", action="store_true", help="Skips using random user agents"
-)
-parser.add_argument(
-    "-wh", "--webhook", type=str, help="Webhook URL for notifications (in beta)"
-)
-parser.add_argument(
-    "-sr", "--skiprestore", action="store_true", help="Skips the restore file"
-)
-parser.add_argument("-p", "--proxy", type=str, help="proxy")
-parser.add_argument(
-    "-W", "--webscraper", action="store_true", help="Toggles uses the webscraper"
-)
-parser.add_argument(
-    "-WU", "--webui", action="store_true", help="Enables the web UI for the webscraper."
-)
+# ============================================================
+# ROTA /search
+# Body: { "name": "alfred" }
+# Retorna JSON com resultados
+# ============================================================
+@app.route("/search", methods=["POST", "OPTIONS"])
+def search():
+    if request.method == "OPTIONS":
+        return "", 200
 
-parser.add_argument(
-    "-sC", "--script", action="store_true", help="Disables UI and only displays results."
-)
-parser.add_argument(
-    "-o",
-    "--output",
-    choices=["txt", "csv", "json"],
-    default="txt",
-    help="Output format (txt, csv, json)",
-)
-parser.add_argument(
-    "-D", "--delay", type=int, help="Delay webscraper should wait for the page to load"
-)
-parser.add_argument(
-    "-a", "--all", action="store_true", help="Show all results (positive and negative)"
-)
-parser.add_argument(
-    "-H", "--harvest", action="store_true", help="Webscrape data from the sites"
-)
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception as e:
+        return jsonify({"error": "JSON invalido", "detail": str(e)}), 400
 
-# initializes the arg parser as a variable
-args = parser.parse_args()
-# arguments as variables
-if args.userfile:
-    users = load_user_file(args.userfile)
-else:
-    users = [args.user]
-threads = args.threads
-debug = args.debug
-skip_headers = args.skipheaders
-output_format = args.output
-webscrape = args.webscraper
-delay = args.delay
-allsites = args.all
-# loads the fields to scrape
-field_configs = load_fields()
-# basic argument validation for clearer errors
-if threads < 1:
-    parser.error("-t/--threads must be 1 or greater")
+    name = (data.get("name") or "").strip().replace(" ", "")
 
-if delay is not None and delay < 0:
-    parser.error("-D/--delay must be 0 or greater")
+    if not name:
+        return jsonify({"error": "Parametro 'name' obrigatorio"}), 400
 
-if args.userfile and not users:
-    parser.error("-U/--userfile does not contain any usernames")
+    # Snapshot de arquivos antes da execucao
+    before_files = set(glob.glob(os.path.join(REPO_ROOT, "*.json")))
 
-if args.webui:
-    parser.error("-WU/--webui is not yet implemented. Please use -W/--webscraper instead.")
+    # Comando correto do Tookie (script mode, JSON output)
+    cmd = [
+        sys.executable, "brib.py",
+        "-u", name,
+        "-sC",       # modo script (sem UI)
+        "-o", "json" # saida JSON
+    ]
 
-# makes sure threads is not used with the webscraper
-if args.webscraper and args.threads != parser.get_default("threads"):
-    parser.print_help()
-    parser.exit(
-        status=1,
-        message="\n[!] Error: -W (webscraper) cannot be used with -t (threads)\n",
-    )
-# checks for update
-if not args.script:
-    check_update()
-# asks to download request agent file
-if not args.script:
-    get_header_file(debug)
-
-if args.webhook:
-    send_webhook(args.webhook, users[0], f"Scan started for username: {users[0]}")
-
-# checks/loads restore file and loads sites
-if args.skiprestore:
-    sites = load_sites(debug)
-if len(users) == 1 and not args.skiprestore:
-    restore_site = load_restore()
-    sites = load_sites(debug, restore_site)
-    
-# debuging options
-if debug:
-    print("DEBUG")
-    print("Opening Scan File")
-
-# loads user agents
-user_agents = []
-if not skip_headers:
-    user_agents = load_user_agents()
-    if not user_agents:
-        print(
-            "[!] No headers loaded. Continuing without random User-Agent headers. Skipping header usage."
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=REPO_ROOT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"}
         )
-        skip_headers = True
-# writes scan file (will be removed)
-# scan_file(user,0)
 
-# Main Function
-all_results = {}
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
 
+        # Procura arquivo JSON novo criado
+        time.sleep(0.5)
+        after_files = set(glob.glob(os.path.join(REPO_ROOT, "*.json")))
+        new_files = list(after_files - before_files)
 
-total_users = len(users)
+        accounts = []
 
-for idx, user in enumerate(users, start=1):
-    if not args.script:
-        print(f"\n[+] Scanning username: {user}")
-        logo(user, idx, total_users)
-    # gets basic system info for the logo
-    if webscrape:
-        threads = 1
-
-    # displays system info for the logo
-    if not args.script:
-        get_system_data(threads, skip_headers)
-
-    results = []
-
-    if not webscrape:
-        with ThreadPoolExecutor(max_workers=threads) as executor:
-            futures = [
-                executor.submit(
-                    scan_site, site, user, debug, skip_headers, user_agents, allsites, args
-                )
-                for site in sites
-            ]
-
+        # Tenta ler arquivo novo
+        for f in new_files:
             try:
-                for future in as_completed(futures):
-                    res = future.result()
-                    if res:
-                        results.append(res)
-                        if args.webhook:
-                         send_webhook(args.webhook, user, f"Found result for username: {user} on site: {res}", type="site")
-                
-            except KeyboardInterrupt:
-                print("Stopping!")
-                executor.shutdown(wait=False)
-                break
+                with open(f, "r", encoding="utf-8") as fh:
+                    content = fh.read()
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list):
+                        accounts.extend(parsed)
+                    elif isinstance(parsed, dict):
+                        accounts.append(parsed)
+            except Exception:
+                pass
 
-    else:
-        try:
-            if args.harvest:
-                scan_webscraper(
-                    user,
-                    debug=debug,
-                    field_configs=field_configs,
-                    skip_headers=skip_headers,
-                    user_agents=user_agents,
-                    delay=delay,
-                    allsites=allsites,
-                )
-            else:
-                scan_webscraper(
-                    user,
-                    debug=debug,
-                    skip_headers=skip_headers,
-                    user_agents=user_agents,
-                    delay=delay,
-                    allsites=allsites,
-                )
-        except KeyboardInterrupt:
-            print("\nStopping web scraper...")
-        finally:
-            close_driver()
-    # makes restore point
-    make_restore(results, user)
- 
-    all_results[user] = results
+        # Fallback: parse do stdout
+        if not accounts and stdout:
+            accounts = parse_text_output(stdout)
 
-    # write output per-user
-    write_to_file(user, results, output_format)
+        return jsonify({
+            "success": True,
+            "name": name,
+            "accounts": accounts,
+            "total_found": len(accounts),
+            "stderr_snippet": stderr[:300] if stderr else None
+        })
 
-print("    ==============================================")
-print("Scan done!")
-exit(0)
+    except subprocess.TimeoutExpired:
+        return jsonify({
+            "success": False,
+            "error": "Timeout (120s)"
+        }), 504
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": "Erro ao executar",
+            "detail": str(e)
+        }), 500
+
+
+def parse_text_output(output):
+    """Extrai URLs de redes sociais do texto"""
+    import re
+    accounts = []
+    seen = set()
+
+    patterns = {
+        "instagram": r'https?://(?:www\.)?instagram\.com/[\w.\-]+',
+        "twitter": r'https?://(?:www\.)?(?:twitter|x)\.com/[\w.\-]+',
+        "tiktok": r'https?://(?:www\.)?tiktok\.com/@[\w.\-]+',
+        "facebook": r'https?://(?:www\.)?facebook\.com/[\w.\-]+',
+        "linkedin": r'https?://(?:www\.)?linkedin\.com/in/[\w.\-]+',
+        "github": r'https?://(?:www\.)?github\.com/[\w.\-]+',
+        "youtube": r'https?://(?:www\.)?youtube\.com/@[\w.\-]+',
+    }
+
+    for platform, pattern in patterns.items():
+        urls = re.findall(pattern, output)
+        for url in urls:
+            url = url.rstrip(".,;)\"'")
+            if url in seen:
+                continue
+            seen.add(url)
+            accounts.append({
+                "platform": platform,
+                "url": url,
+                "username": url.rstrip("/").split("/")[-1]
+            })
+
+    return accounts
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port, debug=False)
