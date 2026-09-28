@@ -1,24 +1,24 @@
 # ============================================================
-# Tookie-OSINT API Wrapper
-# Transforma o Tookie-OSINT (CLI) em API REST para o Blitz 360
+# Tookie-OSINT API Wrapper (v2)
+# Chama o brib.py corretamente e retorna JSON
 # ============================================================
 
 import os
 import sys
 import json
+import glob
+import time
 import subprocess
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
 app = Flask(__name__)
-CORS(app)  # Permite chamadas do Blitz 360
+CORS(app)
 
-# Versão da API
-API_VERSION = "1.0.0"
+API_VERSION = "2.0.0"
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-# ============================================================
-# ROTA RAIZ — Health check (para o Render saber que está OK)
-# ============================================================
+
 @app.route("/", methods=["GET"])
 def home():
     return jsonify({
@@ -26,21 +26,17 @@ def home():
         "version": API_VERSION,
         "status": "online",
         "endpoints": {
-            "POST /search": "Busca por nome e cidade",
-            "GET /health": "Status da API"
+            "POST /search": "Busca por username",
+            "GET /health": "Status"
         }
     })
+
 
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "version": API_VERSION})
 
 
-# ============================================================
-# ROTA PRINCIPAL — /search
-# Recebe: { "name": "Max Növara", "city": "Uberlândia" }
-# Retorna: JSON com perfis encontrados
-# ============================================================
 @app.route("/search", methods=["POST", "OPTIONS"])
 def search():
     if request.method == "OPTIONS":
@@ -49,112 +45,108 @@ def search():
     try:
         data = request.get_json(force=True) or {}
     except Exception as e:
-        return jsonify({"error": "JSON inválido", "detail": str(e)}), 400
+        return jsonify({"error": "JSON invalido", "detail": str(e)}), 400
 
-    name = (data.get("name") or "").strip()
-    city = (data.get("city") or "").strip()
+    name = (data.get("name") or "").strip().replace(" ", "")
 
     if not name:
-        return jsonify({"error": "Parâmetro 'name' obrigatório"}), 400
+        return jsonify({"error": "Parametro 'name' obrigatorio"}), 400
 
-    # Monta comando do Tookie
-    # Formato esperado: tookie --name "X" --city "Y"
-    cmd = [sys.executable, "-m", "tookie", "--name", name]
-    if city:
-        cmd.extend(["--city", city])
+    # Snapshot de arquivos antes da execucao
+    before_files = set(glob.glob(os.path.join(REPO_ROOT, "*.json")))
+
+    # Comando correto do Tookie (script mode, JSON output)
+    cmd = [
+        sys.executable, "brib.py",
+        "-u", name,
+        "-sC",
+        "-o", "json"
+    ]
 
     try:
-        # Executa o Tookie com timeout de 60s
         result = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=60,
-            cwd=os.path.dirname(os.path.abspath(__file__))
+            timeout=120,
+            cwd=REPO_ROOT,
+            env={**os.environ, "PYTHONUNBUFFERED": "1"}
         )
 
         stdout = result.stdout or ""
         stderr = result.stderr or ""
 
-        # Tenta extrair JSON da saída (Tookie pode retornar texto)
-        accounts = parse_tookie_output(stdout)
+        # Procura arquivo JSON novo criado
+        time.sleep(0.5)
+        after_files = set(glob.glob(os.path.join(REPO_ROOT, "*.json")))
+        new_files = list(after_files - before_files)
+
+        accounts = []
+
+        for f in new_files:
+            try:
+                with open(f, "r", encoding="utf-8") as fh:
+                    content = fh.read()
+                    parsed = json.loads(content)
+                    if isinstance(parsed, list):
+                        accounts.extend(parsed)
+                    elif isinstance(parsed, dict):
+                        accounts.append(parsed)
+            except Exception:
+                pass
+
+        if not accounts and stdout:
+            accounts = parse_text_output(stdout)
 
         return jsonify({
             "success": True,
             "name": name,
-            "city": city,
             "accounts": accounts,
-            "raw_output": stdout[:2000] if not accounts else None,
-            "stderr": stderr[:500] if stderr else None
+            "total_found": len(accounts),
+            "stderr_snippet": stderr[:300] if stderr else None
         })
 
     except subprocess.TimeoutExpired:
-        return jsonify({
-            "success": False,
-            "error": "Tempo esgotado (60s). Tente novamente."
-        }), 504
+        return jsonify({"success": False, "error": "Timeout (120s)"}), 504
     except Exception as e:
         return jsonify({
             "success": False,
-            "error": "Falha ao executar Tookie",
+            "error": "Erro ao executar",
             "detail": str(e)
         }), 500
 
 
-# ============================================================
-# Parser do output do Tookie
-# ============================================================
-def parse_tookie_output(output):
-    """Extrai contas/perfis do output do Tookie"""
-    accounts = []
-
-    if not output:
-        return accounts
-
-    # Tenta JSON primeiro
-    try:
-        data = json.loads(output)
-        if isinstance(data, list):
-            return data
-        if isinstance(data, dict) and "results" in data:
-            return data["results"]
-    except (json.JSONDecodeError, ValueError):
-        pass
-
-    # Fallback: busca URLs de redes sociais no texto
+def parse_text_output(output):
     import re
-    url_pattern = r'https?://(?:www\.)?(instagram\.com|twitter\.com|x\.com|tiktok\.com|facebook\.com|linkedin\.com|youtube\.com|github\.com)/[^\s"\'<>]+'
-    urls = re.findall(url_pattern, output)
-    full_urls = re.findall(r'https?://[^\s"\'<>]+', output)
-
+    accounts = []
     seen = set()
-    for url in full_urls:
-        url = url.rstrip(".,;")
-        if url in seen:
-            continue
-        seen.add(url)
 
-        platform = "unknown"
-        if "instagram" in url: platform = "instagram"
-        elif "twitter" in url or "x.com" in url: platform = "twitter"
-        elif "tiktok" in url: platform = "tiktok"
-        elif "facebook" in url: platform = "facebook"
-        elif "linkedin" in url: platform = "linkedin"
-        elif "youtube" in url: platform = "youtube"
-        elif "github" in url: platform = "github"
+    patterns = {
+        "instagram": r'https?://(?:www\.)?instagram\.com/[\w.\-]+',
+        "twitter": r'https?://(?:www\.)?(?:twitter|x)\.com/[\w.\-]+',
+        "tiktok": r'https?://(?:www\.)?tiktok\.com/@[\w.\-]+',
+        "facebook": r'https?://(?:www\.)?facebook\.com/[\w.\-]+',
+        "linkedin": r'https?://(?:www\.)?linkedin\.com/in/[\w.\-]+',
+        "github": r'https?://(?:www\.)?github\.com/[\w.\-]+',
+        "youtube": r'https?://(?:www\.)?youtube\.com/@[\w.\-]+',
+    }
 
-        accounts.append({
-            "platform": platform,
-            "url": url,
-            "username": url.rstrip("/").split("/")[-1]
-        })
+    for platform, pattern in patterns.items():
+        urls = re.findall(pattern, output)
+        for url in urls:
+            url = url.rstrip(".,;)\"'")
+            if url in seen:
+                continue
+            seen.add(url)
+            accounts.append({
+                "platform": platform,
+                "url": url,
+                "username": url.rstrip("/").split("/")[-1]
+            })
 
     return accounts
 
 
-# ============================================================
-# Inicialização
-# ============================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=False)
